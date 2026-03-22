@@ -1,0 +1,149 @@
+# Cocotb 验证工作流示例配置
+
+# ===== 模板变量定义（Template Variables） =====
+template_overwrite:
+  PROJECT: "SimpleCounter"
+  DUT: "SimpleCounter"
+  OUT: "output"
+  DOC_GEN_LANG: "中文"
+
+# ===== 保护目录配置 =====
+un_write_dirs:
+  - "SimpleCounter/"
+  - "Guide_Doc/"
+  - "cocotb_tests/"
+
+# ===== 任务描述（Mission） =====
+mission:
+  name: "{DUT} 模块 Cocotb 验证任务"
+  prompt:
+    system: |
+      你是一位专业的 RTL 验证工程师，擅长使用 cocotb 框架进行硬件模块验证。
+
+      你的任务是：
+      1. 阅读 DUT 规格文档，理解模块功能和接口
+      2. 使用 cocotb 框架生成完整的测试环境
+      3. 编写测试用例覆盖所有功能点
+      4. 运行仿真并修复问题
+      5. 确保测试通过并生成验证报告
+
+      请使用工具 ReadTextFile 读取文件内容，使用 EditTextFile 创建或修改文件。
+      使用 RunCocotb 工具运行仿真，使用 Check 和 Complete 推进验证流程。
+      完成每个阶段后，务必使用 Complete 工具检查并推进到下一阶段。
+
+# ===== 工作流定义（Stages） =====
+stage:
+  # ========== 阶段 1：生成 Cocotb 测试框架 ==========
+  - name: generate_cocotb_framework
+    desc: "生成 Cocotb 测试框架"
+    task:
+      - "第 1 步：使用 ReadTextFile 读取 SimpleCounter/README.md 或 SimpleCounter/SimpleCounter.v，了解 DUT 接口"
+      - "第 2 步：参考 Guide_Doc/cocotb_guide.md 了解 cocotb 模板结构"
+      - "第 3 步：创建 cocotb_tests/ 目录"
+      - "第 4 步：根据模板生成 cocotb_tests/Makefile，配置正确的 TOPLEVEL 和仿真器"
+      - "第 5 步：根据模板生成 cocotb_tests/test_{DUT}_basic.py，填充 DUT 名称"
+      - "第 6 步：根据模板生成 cocotb_tests/{DUT}_env.py，定义接口和环境类"
+      - "第 7 步：使用 Complete 工具完成当前阶段"
+    reference_files:
+      - "Guide_Doc/cocotb_guide.md"
+      - "template/cocotb/Makefile"
+      - "template/cocotb/test_{{DUT}}_basic.py"
+      - "template/cocotb/{{DUT}}_env.py"
+    output_files:
+      - "cocotb_tests/Makefile"
+      - "cocotb_tests/test_{DUT}_basic.py"
+      - "cocotb_tests/{DUT}_env.py"
+    checker:
+      - name: test_file_structure_check
+        clss: "CocotbTestFileChecker"
+        args:
+          test_file: "cocotb_tests/test_{DUT}_basic.py"
+          min_tests: 3
+          require_reset: true
+          require_clock: true
+      - name: markdown_format_check
+        clss: "UnityChipCheckerMarkdownFileFormat"
+        args:
+          markdown_file_list:
+            - "cocotb_tests/Makefile"
+          no_line_break: true
+
+  # ========== 阶段 2：运行基础测试 ==========
+  - name: run_basic_tests
+    desc: "运行基础 Cocotb 测试"
+    task:
+      - "第 1 步：使用 RunCocotb 工具运行基础测试 MODULE=test_{DUT}_basic"
+      - "第 2 步：如果仿真失败，分析日志找出原因"
+      - "第 3 步：修复 RTL 编译错误或测试代码问题"
+      - "第 4 步：重新运行测试直到通过"
+      - "第 5 步：使用 Complete 工具完成当前阶段"
+    reference_files:
+      - "cocotb_tests/test_{DUT}_basic.py"
+      - "cocotb_tests/Makefile"
+    checker:
+      - name: cocotb_simulation_check
+        clss: "CocotbTestChecker"
+        args:
+          test_module: "test_{DUT}_basic"
+          toplevel: "{DUT}"
+          sim: "verilator"
+          test_dir: "cocotb_tests"
+          timeout: 300
+          must_pass: true
+
+  # ========== 阶段 3：扩展测试覆盖率 ==========
+  - name: extend_test_coverage
+    desc: "扩展测试覆盖率"
+    task:
+      - "第 1 步：分析当前测试覆盖的功能点"
+      - "第 2 步：添加边界测试用例（如 test_{DUT}_edge_cases）"
+      - "第 3 步：添加性能测试用例（如 test_{DUT}_performance）"
+      - "第 4 步：添加随机测试用例（如 test_{DUT}_random）"
+      - "第 5 步：运行所有测试确保通过"
+      - "第 6 步：使用 Complete 工具完成当前阶段"
+    reference_files:
+      - "cocotb_tests/test_{DUT}_basic.py"
+    output_files:
+      - "cocotb_tests/test_{DUT}_edge_cases.py"
+      - "cocotb_tests/test_{DUT}_performance.py"
+    checker:
+      - name: test_file_count_check
+        clss: "CocotbTestFileChecker"
+        args:
+          test_file: "cocotb_tests/test_{DUT}_edge_cases.py"
+          min_tests: 2
+      - name: cocotb_simulation_check
+        clss: "CocotbTestChecker"
+        args:
+          test_module: "test_{DUT}_edge_cases"
+          toplevel: "{DUT}"
+          sim: "verilator"
+          test_dir: "cocotb_tests"
+          timeout: 300
+          must_pass: true
+
+  # ========== 阶段 4：生成验证报告 ==========
+  - name: generate_verification_report
+    desc: "生成验证报告"
+    task:
+      - "第 1 步：运行所有测试收集结果"
+      - "第 2 步：分析测试通过率和覆盖率"
+      - "第 3 步：创建 output/{DUT}_verification_report.md"
+      - "第 4 步：记录测试统计、覆盖率和已知问题"
+      - "第 5 步：使用 Complete 工具完成当前阶段"
+    reference_files:
+      - "cocotb_tests/"
+    output_files:
+      - "output/{DUT}_verification_report.md"
+    checker:
+      - name: report_file_check
+        clss: "CocotbTestFileChecker"
+        args:
+          test_file: "output/{DUT}_verification_report.md"
+          min_tests: 1
+      - name: cocotb_coverage_check
+        clss: "CocotbCoverageChecker"
+        args:
+          coverage_dir: "coverage"
+          min_line_coverage: 0.0
+          min_toggle_coverage: 0.0

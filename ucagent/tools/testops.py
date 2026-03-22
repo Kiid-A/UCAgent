@@ -12,12 +12,14 @@ from pydantic import BaseModel, Field
 from ucagent.util.test_tools import ucagent_lib_path
 from ucagent.util.functions import get_toffee_json_test_case, load_toffee_report
 from ucagent.util.log import debug, info, warning
+import json
 import os
+import shlex
 import shutil
+import subprocess
+import sys
 import psutil
 from typing import Tuple
-import subprocess
-import json
 
 
 class ArgRunPyTest(BaseModel):
@@ -289,4 +291,299 @@ class RunUnityChipTest(RunPyTest):
         self.set_pytest_args({
             "report-dir": self.result_dir
         })
+        return self
+
+
+class ArgRunCocotb(BaseModel):
+    """Arguments for running a cocotb simulation."""
+    module_name: str = Field(
+        ...,
+        description="The cocotb test module name to run (for example 'test_counter' or 'tb_packet_gen_and_parse')."
+    )
+    toplevel: str = Field(
+        ...,
+        description="The top-level RTL entity/module name (e.g., 'SimpleCounter', 'Adder')."
+    )
+    sim: str = Field(
+        default="verilator",
+        description="Simulator to use: 'verilator', 'icarus', 'modelsim', 'vcs', 'questa', etc."
+    )
+    test_dir: str = Field(
+        default=".",
+        description="Directory containing the cocotb test and/or Makefile."
+    )
+    timeout: int = Field(
+        default=60,
+        description="Timeout for the simulation in seconds."
+    )
+    return_log: bool = Field(
+        default=True,
+        description="Whether to return the simulation log output."
+    )
+    extra_env: dict = Field(
+        default={},
+        description="Additional environment variables to pass to the simulation."
+    )
+    run_mode: str = Field(
+        default="auto",
+        description="Invocation mode: 'auto', 'make', 'pytest', or 'python'."
+    )
+    make_target: str = Field(
+        default="",
+        description="Optional make target, such as 'cocotb' or 'run_system_test_server_loopback'."
+    )
+    make_args: str = Field(
+        default="",
+        description="Additional make arguments, for example 'TOP_MODULE=mkTop TB_FILE=tb_xxx.py'."
+    )
+    script_file: str = Field(
+        default="",
+        description="Python test script to execute when using 'python' or 'pytest' mode."
+    )
+    pytest_args: str = Field(
+        default="",
+        description="Additional pytest arguments when using 'pytest' mode."
+    )
+
+
+class RunCocotb(UCTool):
+    """Tool to run cocotb simulations for RTL verification.
+    
+    This tool executes cocotb tests using the standard Makefile-based flow.
+    It supports multiple simulators and provides detailed log output for debugging.
+    
+    Usage example:
+        RunCocotb().do(
+            module_name="test_counter",
+            toplevel="SimpleCounter",
+            sim="verilator",
+            test_dir="./cocotb_tests",
+            timeout=300
+        )
+    """
+
+    name: str = "RunCocotb"
+    description: str = (
+        "Run cocotb simulation for RTL verification.\n"
+        "Supports setting module name, toplevel entity, and simulator type.\n"
+        "Returns simulation pass/fail status and optional log output.\n"
+        "Use this tool when you need to verify RTL designs using cocotb framework.\n"
+        "Common simulators: verilator (free), icarus (free), modelsim, vcs, questa.\n"
+    )
+    args_schema: ArgsSchema = ArgRunCocotb
+    return_direct: bool = False
+
+    # custom variables
+    workspace: str = Field(
+        default=".",
+        description="The workspace directory for cocotb tests."
+    )
+    result_dir: str = Field(
+        default="cocotb_results",
+        description="Directory to save cocotb simulation results."
+    )
+
+    def _split_cli_args(self, value) -> list[str]:
+        if value is None or value == "":
+            return []
+        if isinstance(value, str):
+            return shlex.split(value)
+        if isinstance(value, (list, tuple)):
+            return [str(v) for v in value]
+        raise ValueError(f"Unsupported command argument type: {type(value)}")
+
+    def _resolve_test_dir(self, test_dir: str) -> str:
+        base_dir = self.workspace if getattr(self, "workspace", None) else os.getcwd()
+        if not test_dir or test_dir == ".":
+            return os.path.abspath(base_dir)
+        if os.path.isabs(test_dir):
+            return os.path.abspath(test_dir)
+        return os.path.abspath(os.path.join(base_dir, test_dir))
+
+    def _resolve_script_path(self, abs_test_dir: str, script_file: str) -> str | None:
+        if not script_file:
+            return None
+        if os.path.isabs(script_file):
+            return os.path.abspath(script_file)
+        return os.path.abspath(os.path.join(abs_test_dir, script_file))
+
+    def do(self,
+           module_name: str,
+           toplevel: str,
+           sim: str = "verilator",
+           test_dir: str = ".",
+           timeout: int = 60,
+           return_log: bool = True,
+           extra_env: dict = {},
+           run_mode: str = "auto",
+           make_target: str = "",
+           make_args: str = "",
+           script_file: str = "",
+           pytest_args: str = "",
+           run_manager: CallbackManagerForToolRun = None) -> Tuple[bool, str, str]:
+        """Run a cocotb simulation.
+
+        Supports the standard Makefile-based flow, pytest-based cocotb flow,
+        and direct execution of project-specific cocotb Python scripts.
+        """
+        import psutil
+
+        ret_stdout, ret_stderr = "", ""
+        env = os.environ.copy()
+
+        env["MODULE"] = module_name
+        env["TOPLEVEL"] = toplevel
+        env["SIM"] = sim
+        env["TOPLEVEL_LANG"] = env.get("TOPLEVEL_LANG", "verilog")
+        env.update({k: str(v) for k, v in (extra_env or {}).items()})
+
+        abs_test_dir = self._resolve_test_dir(test_dir)
+        if not os.path.exists(abs_test_dir):
+            return False, "", f"Test directory does not exist: {abs_test_dir}"
+
+        default_script = script_file or f"{module_name}.py"
+        abs_script_path = self._resolve_script_path(abs_test_dir, default_script) if default_script else None
+        if abs_script_path and not os.path.exists(abs_script_path):
+            abs_script_path = None
+
+        python_paths = [os.path.abspath(os.getcwd()), abs_test_dir]
+        if abs_script_path:
+            script_dir = os.path.dirname(abs_script_path)
+            if script_dir and script_dir not in python_paths:
+                python_paths.append(script_dir)
+        pythonpath = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = ":".join([p for p in python_paths if p] + ([pythonpath] if pythonpath else []))
+
+        makefile_path = os.path.join(abs_test_dir, "Makefile")
+        has_makefile = os.path.exists(makefile_path)
+        run_mode = (run_mode or "auto").lower()
+        if run_mode == "auto":
+            if has_makefile and (make_target or make_args):
+                run_mode = "make"
+            elif abs_script_path is not None:
+                run_mode = "python"
+            elif has_makefile:
+                run_mode = "make"
+            else:
+                run_mode = "pytest"
+
+        work_dir = abs_test_dir
+        if run_mode == "make":
+            if not has_makefile:
+                return False, "", f"Makefile not found in test directory: {abs_test_dir}"
+            cmd = ["make", *self._split_cli_args(make_target), *self._split_cli_args(make_args)]
+        elif run_mode == "python":
+            if abs_script_path is None:
+                return False, "", f"Python cocotb script not found: {script_file or default_script}"
+            script_arg = os.path.relpath(abs_script_path, abs_test_dir) if abs_script_path.startswith(abs_test_dir) else abs_script_path
+            cmd = [sys.executable, script_arg]
+        elif run_mode == "pytest":
+            cmd = ["pytest", "-s"]
+            if abs_script_path is not None:
+                script_arg = os.path.relpath(abs_script_path, abs_test_dir) if abs_script_path.startswith(abs_test_dir) else abs_script_path
+                cmd.append(script_arg)
+            else:
+                cmd.append(f"--cocotb-module={module_name}")
+            cmd.extend(self._split_cli_args(pytest_args))
+        else:
+            return False, "", f"Unsupported run_mode: {run_mode}"
+
+        info(f"Run cocotb [{run_mode}]: {' '.join(cmd)} MODULE={module_name} TOPLEVEL={toplevel} SIM={sim} (in {work_dir})")
+        
+        try:
+            worker = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE if return_log else subprocess.DEVNULL,
+                stderr=subprocess.PIPE if return_log else subprocess.DEVNULL,
+                text=True,
+                env=env,
+                bufsize=1,
+                cwd=work_dir
+            )
+            self.pre_call(worker)
+            ret_stdout, ret_stderr = worker.communicate(timeout=timeout)
+            success = worker.returncode == 0
+            return success, ret_stdout if return_log else "", ret_stderr if return_log else ""
+            
+        except subprocess.TimeoutExpired as e:
+            try:
+                worker.terminate()
+                _, alive = psutil.wait_procs([worker], timeout=3)
+                if alive:
+                    worker.kill()
+            except Exception as ex:
+                warning(f"Error terminating process: {ex}")
+            ret_stdout, ret_stderr = worker.communicate()
+            return False, ret_stdout, ret_stderr + f"\nSimulation timed out after {timeout} seconds. Consider increasing timeout."
+            
+        except FileNotFoundError:
+            return False, "", f"Command not found: {cmd[0]}. Please ensure the required runtime is installed and available in PATH."
+            
+        except Exception as e:
+            return False, "", f"Error running cocotb: {str(e)}"
+
+    def _run(self,
+             module_name: str,
+             toplevel: str,
+             sim: str = "verilator",
+             test_dir: str = ".",
+             timeout: int = 60,
+             return_log: bool = True,
+             extra_env: dict = {},
+             run_mode: str = "auto",
+             make_target: str = "",
+             make_args: str = "",
+             script_file: str = "",
+             pytest_args: str = "",
+             run_manager: CallbackManagerForToolRun = None) -> str:
+        """Run cocotb simulation and return formatted result."""
+        success, stdout, stderr = self.do(
+            module_name,
+            toplevel,
+            sim,
+            test_dir,
+            timeout,
+            return_log,
+            extra_env,
+            run_mode,
+            make_target,
+            make_args,
+            script_file,
+            pytest_args,
+            run_manager
+        )
+        
+        result = f"=== Cocotb Simulation {'PASSED' if success else 'FAILED'} ===\n"
+        result += f"Module: {module_name}\n"
+        result += f"Toplevel: {toplevel}\n"
+        result += f"Simulator: {sim}\n"
+        
+        if return_log:
+            if stdout:
+                result += f"\n=== STDOUT ===\n{stdout}\n"
+            if stderr:
+                result += f"\n=== STDERR ===\n{stderr}\n"
+        
+        if not success:
+            result += "\n=== FAILURE ANALYSIS ===\n"
+            result += "Check the log output above for error messages.\n"
+            result += "Common issues:\n"
+            result += "  - Simulator not installed or not in PATH\n"
+            result += "  - RTL compilation errors\n"
+            result += "  - Cocotb test assertion failures\n"
+            result += "  - Timeout (increase timeout argument if needed)\n"
+        
+        return result
+
+    def __init__(self, workspace: str = None, result_dir: str = "cocotb_results", **kwargs):
+        """Initialize the RunCocotb tool."""
+        super().__init__(**kwargs)
+        self.result_dir = result_dir
+        if workspace is not None:
+            self.set_workspace(workspace)
+
+    def set_workspace(self, workspace: str):
+        """Set the workspace directory."""
+        self.workspace = os.path.abspath(workspace)
+        self.result_dir = os.path.join(self.workspace, self.result_dir)
         return self
